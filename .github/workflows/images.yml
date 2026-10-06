@@ -1,0 +1,140 @@
+name: Images
+
+on:
+  push:
+    branches: [main]
+    # Docs (src/*/README.md, NOTES.md) don't change the images
+    paths: ["images/**", "src/**", "!src/*/*.md", "scripts/build.sh", ".github/workflows/images.yml", ".github/workflows/build-image.yml"]
+  schedule:
+    - cron: "0 4 * * 1" # weekly, to pick up Debian security updates
+  workflow_dispatch:
+
+# One run at a time, since every run pushes to the same build-<arch> tags
+concurrency:
+  group: images
+  cancel-in-progress: false
+
+jobs:
+  # Checks the image versions, works out the tags and lists the images to build
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      base-tags: ${{ steps.prepare.outputs.base-tags }}
+      base-version: ${{ steps.prepare.outputs.base-version }}
+      base: ${{ steps.prepare.outputs.base }}
+      images: ${{ steps.prepare.outputs.images }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # to see what a push changed
+      - id: prepare
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          # Tags for every image: latest, the Debian release base is built on three ways (debian,
+          # its codename and its number, e.g. trixie and debian13), and the date, also with the codename
+          # (trixie-20261006) as Debian's own images have it. Each image adds its
+          # version from its image.json at every level: 1, 1.0 and 1.0.0, and the same with -trixie
+          codename="$(sed -nE 's/^FROM debian:([a-z]+).*/\1/p' images/base/Dockerfile)"
+          [[ -n "${codename}" ]] || { echo "::error::No Debian release in the FROM line of images/base/Dockerfile"; exit 1; }
+          number="$(docker run --rm "debian:${codename}" sh -c '. /etc/os-release && echo "${VERSION_ID}"')"
+          [[ -n "${number}" ]] || { echo "::error::debian:${codename} has no version number"; exit 1; }
+          date="$(date -u +%Y%m%d)"
+          common="latest debian ${codename} debian${number} ${date} ${codename}-${date}"
+          tags() {
+              local major="${1%%.*}" minor="${1%.*}"
+              echo "${common} ${major} ${minor} ${1} ${major}-${codename} ${minor}-${codename} ${1}-${codename}"
+          }
+
+          # An image's version has to change whenever its folder or its features do (docs aside),
+          # compared with the commit that first published the version: git tag image_<name>_<version>
+          declare -A versions
+          status=0
+          for dir in images/*/; do
+              name="$(basename "${dir}")"
+              version="$(jq -r '.version // empty' "${dir}image.json" 2> /dev/null || true)"
+              if ! [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                  echo "::error::${dir}image.json needs a version, e.g. { \"version\": \"1.0.0\" }"
+                  status=1
+                  continue
+              fi
+              versions[${name}]="${version}"
+              git rev-parse -q --verify "refs/tags/image_${name}_${version}" > /dev/null || continue
+              paths=("${dir}")
+              for feature in $(grep -oE '"\./features/[^"]+"' "${dir}devcontainer.json" | cut -d/ -f3 | tr -d '"'); do
+                  paths+=("src/${feature}/" ":(exclude)src/${feature}/*.md")
+              done
+              if ! git diff --quiet "image_${name}_${version}" HEAD -- "${paths[@]}"; then
+                  echo "::error::${dir} or its features changed since version ${version} was published: bump the version in ${dir}image.json"
+                  status=1
+              fi
+          done
+          [[ "${status}" == 0 ]] || exit 1
+          echo "base-version=${versions[base]}" >> "$GITHUB_OUTPUT"
+          echo "base-tags=$(tags "${versions[base]}")" >> "$GITHUB_OUTPUT"
+
+          # Scheduled and manual runs rebuild everything, and so does a push that changes base or
+          # the build itself. Other pushes rebuild the images whose folder or features changed.
+          all=true
+          if [[ "${EVENT}" == push ]] && changed="$(git diff --name-only "${BEFORE}" HEAD 2> /dev/null)" \
+              && ! grep -qE '^(images/base/|scripts/build\.sh$|\.github/workflows/(images|build-image)\.yml$)' <<< "${changed}"; then
+              all=false
+          fi
+          echo "base=${all}" >> "$GITHUB_OUTPUT"
+
+          images="$(for dir in images/*/; do
+              name="$(basename "${dir}")"
+              case "${name}" in
+                  base) continue ;; # built first, by the base job
+                  *) archs='["amd64", "arm64"]' ;;
+              esac
+              if [[ "${all}" == false ]]; then
+                  inputs="^images/${name}/"
+                  for feature in $(grep -oE '"\./features/[^"]+"' "${dir}devcontainer.json" | cut -d/ -f3 | tr -d '"'); do
+                      inputs+="|^src/${feature}/"
+                  done
+                  # Changes to docs alone don't need a rebuild
+                  grep -E "${inputs}" <<< "${changed}" | grep -qvE '\.md$' || continue
+              fi
+              jq -nc --arg name "${name}" --argjson archs "${archs}" \
+                  --arg version "${versions[${name}]}" --arg tags "$(tags "${versions[${name}]}")" '{$name, $archs, $version, $tags}'
+          done | jq -sc .)"
+          echo "images=${images}" >> "$GITHUB_OUTPUT"
+
+  base:
+    needs: prepare
+    if: needs.prepare.outputs.base == 'true'
+    permissions:
+      contents: write # git tags for published versions
+      packages: write
+    uses: ./.github/workflows/build-image.yml
+    with:
+      image: base
+      archs: '["amd64", "arm64"]'
+      tags: ${{ needs.prepare.outputs.base-tags }}
+      version: ${{ needs.prepare.outputs.base-version }}
+
+  # One call per image, so an image is published as soon as its own builds succeed.
+  # Base comes from the registry, whether this run rebuilt it or not.
+  image:
+    name: ${{ matrix.image.name }}
+    needs: [prepare, base]
+    # Runs when base was rebuilt or skipped, not when it failed. Skipped when no image
+    # needs building, since an empty matrix is an error
+    if: ${{ !cancelled() && needs.prepare.result == 'success' && needs.base.result != 'failure' && needs.prepare.outputs.images != '[]' }}
+    permissions:
+      contents: write # git tags for published versions
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJSON(needs.prepare.outputs.images) }}
+    uses: ./.github/workflows/build-image.yml
+    with:
+      image: ${{ matrix.image.name }}
+      archs: ${{ toJSON(matrix.image.archs) }}
+      tags: ${{ matrix.image.tags }}
+      version: ${{ matrix.image.version }}

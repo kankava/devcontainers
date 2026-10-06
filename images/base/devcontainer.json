@@ -1,0 +1,7 @@
+{
+  "name": "base",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "remoteUser": "dev"
+}

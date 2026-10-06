@@ -1,0 +1,9 @@
+// markdownlint-cli2 settings
+{
+  "config": {
+    // Paragraphs are one line each
+    "MD013": false,
+    // Tables with their columns lined up, as Prettier formats them
+    "MD060": { "style": "aligned" }
+  }
+}
