@@ -81,7 +81,7 @@ Each image's version is in its `image.json`. Bump it when the image's folder or 
 
 GitHub's ARM runners are free for public repositories; a private one needs paid larger runners.
 
-New GHCR packages start out private. After the first run, make each package public in its GitHub package settings.
+Packages published from a public repository like this one are public too, so pulling them needs no login.
 
 ## License
 
