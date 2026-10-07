@@ -1,12 +1,12 @@
 name: Images
 
+# A release is a push that bumps versions (scripts/bump.sh); every other push still runs the
+# version checks. Running it by hand publishes whatever a failed run left unpublished.
 on:
   push:
     branches: [main]
     # Docs (src/*/README.md, NOTES.md) don't change the images
-    paths: ["images/**", "src/**", "!src/*/*.md", "scripts/build.sh", ".github/workflows/images.yml", ".github/workflows/build-image.yml"]
-  schedule:
-    - cron: "0 4 * * 1" # weekly, to pick up Debian security updates
+    paths: ["images/**", "src/**", "!src/*/*.md", "scripts/**", ".github/workflows/images.yml", ".github/workflows/build-image.yml"]
   workflow_dispatch:
 
 # One run at a time, since every run pushes to the same build-<arch> tags
@@ -15,7 +15,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # Checks the image versions, works out the tags and lists the images to build
+  # Checks the image versions, works out the tags and lists the versions to publish
   prepare:
     runs-on: ubuntu-latest
     permissions:
@@ -28,30 +28,28 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 0 # to see what a push changed
+          fetch-depth: 0 # for the git tags of published versions
       - id: prepare
-        env:
-          EVENT: ${{ github.event_name }}
-          BEFORE: ${{ github.event.before }}
         run: |
           # Tags for every image: latest, the Debian release base is built on three ways (debian,
-          # its codename and its number, e.g. trixie and debian13), and the date, also with the codename
-          # (trixie-20261006) as Debian's own images have it. Each image adds its
-          # version from its image.json at every level: 1, 1.0 and 1.0.0, and the same with -trixie
+          # its codename and its number, e.g. trixie and debian13), and the image's version from
+          # its image.json at every level: 1, 1.0 and 1.0.0, and the same with -trixie
           codename="$(sed -nE 's/^FROM debian:([a-z]+).*/\1/p' images/base/Dockerfile)"
           [[ -n "${codename}" ]] || { echo "::error::No Debian release in the FROM line of images/base/Dockerfile"; exit 1; }
           number="$(docker run --rm "debian:${codename}" sh -c '. /etc/os-release && echo "${VERSION_ID}"')"
           [[ -n "${number}" ]] || { echo "::error::debian:${codename} has no version number"; exit 1; }
-          date="$(date -u +%Y%m%d)"
-          common="latest debian ${codename} debian${number} ${date} ${codename}-${date}"
           tags() {
               local major="${1%%.*}" minor="${1%.*}"
-              echo "${common} ${major} ${minor} ${1} ${major}-${codename} ${minor}-${codename} ${1}-${codename}"
+              echo "latest debian ${codename} debian${number} ${major} ${minor} ${1} ${major}-${codename} ${minor}-${codename} ${1}-${codename}"
           }
 
-          # An image's version has to change whenever its folder or its features do (docs aside),
-          # compared with the commit that first published the version: git tag image_<name>_<version>
+          # Each version is published once, and marked with the git tag image_<name>_<version>.
+          # A published version's files (scripts/inputs.sh) must not have changed since; a new
+          # version must be higher than the last published one, and every image must build on
+          # base's current version
+          base_version="$(jq -r '.version // empty' images/base/image.json 2> /dev/null || true)"
           declare -A versions
+          new=()
           status=0
           for dir in images/*/; do
               name="$(basename "${dir}")"
@@ -62,53 +60,57 @@ jobs:
                   continue
               fi
               versions[${name}]="${version}"
-              git rev-parse -q --verify "refs/tags/image_${name}_${version}" > /dev/null || continue
-              paths=("${dir}")
-              for feature in $(grep -oE '"\./features/[^"]+"' "${dir}devcontainer.json" | cut -d/ -f3 | tr -d '"'); do
-                  paths+=("src/${feature}/" ":(exclude)src/${feature}/*.md")
-              done
-              if ! git diff --quiet "image_${name}_${version}" HEAD -- "${paths[@]}"; then
-                  echo "::error::${dir} or its features changed since version ${version} was published: bump the version in ${dir}image.json"
-                  status=1
+              if [[ "${name}" != base ]]; then
+                  pin="$(sed -nE 's#.*"image": *"[^"]*/base:([^"]+)".*#\1#p' "${dir}devcontainer.json")"
+                  if [[ "${pin}" != "${base_version}" ]]; then
+                      echo "::error::${dir}devcontainer.json builds on base:${pin}, but base is at ${base_version}: scripts/bump.sh image base <level> moves every image to it"
+                      status=1
+                  fi
               fi
+              if git rev-parse -q --verify "refs/tags/image_${name}_${version}" > /dev/null; then
+                  mapfile -t inputs < <(scripts/inputs.sh "${name}")
+                  if ! git diff --quiet "image_${name}_${version}" HEAD -- "${inputs[@]}"; then
+                      echo "::error::${name} changed since version ${version} was published: bump it with scripts/bump.sh"
+                      status=1
+                  fi
+                  continue
+              fi
+              last="$(git tag -l "image_${name}_*" | sed "s/^image_${name}_//" | sort -V | tail -1)"
+              if [[ -n "${last}" && "$(printf '%s\n' "${last}" "${version}" | sort -V | tail -1)" != "${version}" ]]; then
+                  echo "::error::${name} ${version} is lower than its last published version, ${last}"
+                  status=1
+                  continue
+              fi
+              new+=("${name}")
           done
           [[ "${status}" == 0 ]] || exit 1
-          echo "base-version=${versions[base]}" >> "$GITHUB_OUTPUT"
-          echo "base-tags=$(tags "${versions[base]}")" >> "$GITHUB_OUTPUT"
 
-          # Scheduled and manual runs rebuild everything, and so does a push that changes base or
-          # the build itself. Other pushes rebuild the images whose folder or features changed.
-          all=true
-          if [[ "${EVENT}" == push ]] && changed="$(git diff --name-only "${BEFORE}" HEAD 2> /dev/null)" \
-              && ! grep -qE '^(images/base/|scripts/build\.sh$|\.github/workflows/(images|build-image)\.yml$)' <<< "${changed}"; then
-              all=false
-          fi
-          echo "base=${all}" >> "$GITHUB_OUTPUT"
+          base=false
+          for name in "${new[@]}"; do
+              [[ "${name}" != base ]] || base=true
+          done
+          {
+              echo "base=${base}"
+              echo "base-version=${base_version}"
+              echo "base-tags=$(tags "${base_version}")"
+          } >> "$GITHUB_OUTPUT"
 
-          images="$(for dir in images/*/; do
-              name="$(basename "${dir}")"
+          images="$(for name in "${new[@]}"; do
               case "${name}" in
                   base) continue ;; # built first, by the base job
                   *) archs='["amd64", "arm64"]' ;;
               esac
-              if [[ "${all}" == false ]]; then
-                  inputs="^images/${name}/"
-                  for feature in $(grep -oE '"\./features/[^"]+"' "${dir}devcontainer.json" | cut -d/ -f3 | tr -d '"'); do
-                      inputs+="|^src/${feature}/"
-                  done
-                  # Changes to docs alone don't need a rebuild
-                  grep -E "${inputs}" <<< "${changed}" | grep -qvE '\.md$' || continue
-              fi
               jq -nc --arg name "${name}" --argjson archs "${archs}" \
                   --arg version "${versions[${name}]}" --arg tags "$(tags "${versions[${name}]}")" '{$name, $archs, $version, $tags}'
           done | jq -sc .)"
           echo "images=${images}" >> "$GITHUB_OUTPUT"
+          echo "To publish: ${new[*]:-nothing}"
 
   base:
     needs: prepare
     if: needs.prepare.outputs.base == 'true'
     permissions:
-      contents: write # git tags for published versions
+      contents: write # a release, with its git tag, for each published version
       packages: write
     uses: ./.github/workflows/build-image.yml
     with:
@@ -126,7 +128,7 @@ jobs:
     # needs building, since an empty matrix is an error
     if: ${{ !cancelled() && needs.prepare.result == 'success' && needs.base.result != 'failure' && needs.prepare.outputs.images != '[]' }}
     permissions:
-      contents: write # git tags for published versions
+      contents: write # a release, with its git tag, for each published version
       packages: write
     strategy:
       fail-fast: false

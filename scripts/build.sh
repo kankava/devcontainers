@@ -6,13 +6,12 @@
 #
 # Environment:
 #   REGISTRY      image prefix (default: ghcr.io/kankava/devcontainer-images)
-#   TAGS          space-separated tags (default: "latest YYYYMMDD", today's date in UTC)
+#   TAGS          space-separated tags (default: "latest <version>", the version from the image's image.json)
 #   DEVCONTAINER  CLI command (default: devcontainer), e.g. "npx -y @devcontainers/cli"
 #   BUILDX_BUILDER  buildx builder (default: the current Docker context's builder)
 set -euo pipefail
 
 REGISTRY="${REGISTRY:-ghcr.io/kankava/devcontainer-images}"
-read -ra tags <<< "${TAGS:-latest $(date -u +%Y%m%d)}"
 read -ra devcontainer <<< "${DEVCONTAINER:-devcontainer}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
@@ -53,6 +52,11 @@ for name in "$@"; do
         cp -r "${ROOT}/src" "${stage}/${name}/.devcontainer/features"
     fi
 
+    if [[ -n "${TAGS:-}" ]]; then
+        read -ra tags <<< "${TAGS}"
+    else
+        tags=(latest "$(jq -r .version "${ROOT}/images/${name}/image.json")")
+    fi
     args=(build --workspace-folder "${stage}/${name}")
     for tag in "${tags[@]}"; do
         args+=(--image-name "${REGISTRY}/${name}:${tag}")
