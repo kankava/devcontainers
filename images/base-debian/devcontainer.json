@@ -1,0 +1,9 @@
+{
+  "name": "base",
+  "build": {
+    "dockerfile": "Dockerfile",
+    // scripts/build.sh sets VARIANT for each variant it builds
+    "args": { "VARIANT": "${localEnv:VARIANT}" }
+  },
+  "remoteUser": "dev"
+}

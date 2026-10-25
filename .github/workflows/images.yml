@@ -1,0 +1,217 @@
+name: Images
+
+# A release is a push that bumps versions (scripts/bump.sh); every other push still runs the
+# version checks. Running it by hand publishes whatever a failed run left unpublished.
+on:
+  push:
+    branches: [main]
+    # Docs (README.md, NOTES.md) don't change the images
+    paths: ["images/**", "!images/*/*.md", "src/**", "!src/*/*.md", "scripts/**", ".github/workflows/images.yml", ".github/workflows/build-image.yml"]
+  workflow_dispatch:
+
+# One run at a time, since every run pushes to the same build-<variant>-<arch> tags
+concurrency:
+  group: images
+  cancel-in-progress: false
+
+jobs:
+  # Checks the image versions, works out the tags and lists the versions to publish
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      bases: ${{ steps.prepare.outputs.bases }}
+      images: ${{ steps.prepare.outputs.images }}
+      chained: ${{ steps.prepare.outputs.chained }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # for the git tags of published versions
+      - id: prepare
+        run: |
+          # The Debian release of each variant of the base images, from the image their Dockerfile
+          # starts from (FROM debian:${VARIANT}), e.g. "debian 13 trixie" for trixie, and for a
+          # trixie-slim variant too. A base image's default variant is on the newest release
+          declare -A release newest
+          for dir in images/*/; do
+              mapfile -t variants < <(jq -r '.variants // [] | .[]' "${dir}image.json" 2> /dev/null || true)
+              (( ${#variants[@]} > 0 )) || continue
+              from="$(sed -nE 's/^FROM ([^:]+):\$\{VARIANT\}.*/\1/p' "${dir}Dockerfile")"
+              [[ -n "${from}" ]] || { echo "::error::${dir}Dockerfile needs to start from its variant, e.g. FROM debian:\${VARIANT}"; exit 1; }
+              for variant in "${variants[@]}"; do
+                  release[${variant}]="$(docker run --rm "${from}:${variant}" sh -c '. /etc/os-release && echo "${ID} ${VERSION_ID} ${VERSION_CODENAME}"')"
+                  read -r id number codename <<< "${release[${variant}]}"
+                  [[ -n "${codename}" ]] || { echo "::error::${from}:${variant} has no release number or codename"; exit 1; }
+                  [[ -n "${newest[${id}]:-}" ]] || newest[${id}]="${codename}"
+              done
+          done
+
+          # Tags for one variant of an image, all with the variant at the end, e.g. for a trixie-slim variant:
+          # trixie-slim, debian13-slim, and the version at every level: 1-trixie-slim,
+          # 1.0-trixie-slim and 1.0.0-trixie-slim. On the newest Debian release, also debian-slim.
+          # The image's default variant also gets latest and the bare version: 1, 1.0 and 1.0.0
+          tags() { # <version> <variant> <default: true|false>
+              local major="${1%%.*}" minor="${1%.*}" id number codename suffix tags
+              read -r id number codename <<< "${release[$2]}"
+              suffix="${2#"${codename}"}"
+              tags="$2 ${id}${number}${suffix} ${major}-$2 ${minor}-$2 $1-$2"
+              if [[ "${codename}" == "${newest[${id}]}" ]]; then
+                  tags+=" ${id}${suffix}"
+              fi
+              if [[ "$3" == true ]]; then
+                  tags+=" latest ${major} ${minor} $1"
+              fi
+              echo "${tags}"
+          }
+
+          # Each version is published once, and marked with the git tag image_<name>_<version>.
+          # A published version's files (scripts/inputs.sh) must not have changed since; a new
+          # version must be higher than the last published one, and an image built on another
+          # (on base, or e.g. cuda on cpp) must build on that image's current version
+          declare -A infos
+          new=()
+          status=0
+          for dir in images/*/; do
+              name="$(basename "${dir}")"
+              if ! info="$(scripts/image-info.sh "${name}" 2>&1)"; then
+                  echo "::error::${info}"
+                  status=1
+                  continue
+              fi
+              version="$(jq -r '.version // empty' <<< "${info}")"
+              if ! [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                  echo "::error::${dir}image.json needs a version, e.g. { \"version\": \"1.0.0\" }"
+                  status=1
+                  continue
+              fi
+              infos[${name}]="${info}"
+              read -r parent repository pin <<< "$(jq -r '.parent | select(.) | "\(.name) \(.repository) \(.version)"' <<< "${info}")"
+              if [[ -n "${parent}" ]]; then
+                  current="$(jq -r .version "images/${parent}/image.json")"
+                  if [[ "${pin}" != "${current}" ]]; then
+                      echo "::error::${dir}devcontainer.json builds on ${repository} ${pin}, but ${parent} is at ${current}: scripts/bump.sh image ${parent} <level> moves every image built on it"
+                      status=1
+                  fi
+              fi
+              if (( $(jq .depth <<< "${info}") > 2 )); then
+                  echo "::error::${name} builds on an image that builds on an image on base, but the jobs below build three levels at most"
+                  status=1
+              fi
+              if git rev-parse -q --verify "refs/tags/image_${name}_${version}" > /dev/null; then
+                  mapfile -t inputs < <(scripts/inputs.sh "${name}")
+                  if ! git diff --quiet "image_${name}_${version}" HEAD -- "${inputs[@]}"; then
+                      echo "::error::${name} changed since version ${version} was published: bump it with scripts/bump.sh"
+                      status=1
+                  fi
+                  continue
+              fi
+              last="$(git tag -l "image_${name}_*" | sed "s/^image_${name}_//" | sort -V | tail -1)"
+              if [[ -n "${last}" && "$(printf '%s\n' "${last}" "${version}" | sort -V | tail -1)" != "${version}" ]]; then
+                  echo "::error::${name} ${version} is lower than its last published version, ${last}"
+                  status=1
+                  continue
+              fi
+              new+=("${name}")
+          done
+          [[ "${status}" == 0 ]] || exit 1
+
+          # What build-image.yml needs to publish an image: where to, its architectures, and the
+          # tags of each of its variants
+          publish() { # <name>
+              local info="${infos[$1]}" version archs default=true variants=()
+              version="$(jq -r .version <<< "${info}")"
+              case "$1" in
+                  *) archs='["amd64", "arm64"]' ;;
+              esac
+              for variant in $(jq -r '.variants[]' <<< "${info}"); do
+                  variants+=("$(jq -nc --arg name "${variant}" --arg tags "$(tags "${version}" "${variant}" "${default}")" '{$name, $tags}')")
+                  default=false
+              done
+              jq -c --argjson archs "${archs}" --argjson variants "$(printf '%s\n' "${variants[@]}" | jq -sc .)" \
+                  '{name, repository, version, $archs, $variants}' <<< "${info}"
+          }
+          # Built in stages, each after the images it builds on: the base images (the base job),
+          # the images on base (the image job), then the images on those (the chained job)
+          bases=()
+          images=()
+          chained=()
+          for name in "${new[@]}"; do
+              case "$(jq .depth <<< "${infos[${name}]}")" in
+                  0) bases+=("$(publish "${name}")") ;;
+                  1) images+=("$(publish "${name}")") ;;
+                  2) chained+=("$(publish "${name}")") ;;
+              esac
+          done
+          {
+              echo "bases=$(printf '%s\n' "${bases[@]}" | jq -sc .)"
+              echo "images=$(printf '%s\n' "${images[@]}" | jq -sc .)"
+              echo "chained=$(printf '%s\n' "${chained[@]}" | jq -sc .)"
+          } >> "$GITHUB_OUTPUT"
+          echo "To publish: ${new[*]:-nothing}"
+
+  base:
+    name: ${{ matrix.image.name }}
+    needs: prepare
+    # Skipped when no base image needs building, since an empty matrix is an error
+    if: needs.prepare.outputs.bases != '[]'
+    permissions:
+      contents: write # a release, with its git tag, for each published version
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJSON(needs.prepare.outputs.bases) }}
+    uses: ./.github/workflows/build-image.yml
+    with:
+      image: ${{ matrix.image.name }}
+      repository: ${{ matrix.image.repository }}
+      archs: ${{ toJSON(matrix.image.archs) }}
+      variants: ${{ toJSON(matrix.image.variants) }}
+      version: ${{ matrix.image.version }}
+
+  # One call per image, so an image is published as soon as its own builds succeed.
+  # Base comes from the registry, whether this run rebuilt it or not.
+  image:
+    name: ${{ matrix.image.name }}
+    needs: [prepare, base]
+    # Runs when the base images were rebuilt or skipped, not when one failed. Skipped when no
+    # image needs building, since an empty matrix is an error
+    if: ${{ !cancelled() && needs.prepare.result == 'success' && needs.base.result != 'failure' && needs.prepare.outputs.images != '[]' }}
+    permissions:
+      contents: write # a release, with its git tag, for each published version
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJSON(needs.prepare.outputs.images) }}
+    uses: ./.github/workflows/build-image.yml
+    with:
+      image: ${{ matrix.image.name }}
+      repository: ${{ matrix.image.repository }}
+      archs: ${{ toJSON(matrix.image.archs) }}
+      variants: ${{ toJSON(matrix.image.variants) }}
+      version: ${{ matrix.image.version }}
+
+  # Images built on images other than base, e.g. cuda on cpp, once those are published. A job
+  # waits for every entry of the jobs it needs, so these also wait for the other images on base.
+  # The images they build on come from the registry, whether this run rebuilt them or not.
+  chained:
+    name: ${{ matrix.image.name }}
+    needs: [prepare, base, image]
+    # Runs when the earlier stages were built or skipped, not when one failed
+    if: ${{ !cancelled() && needs.prepare.result == 'success' && needs.base.result != 'failure' && needs.image.result != 'failure' && needs.prepare.outputs.chained != '[]' }}
+    permissions:
+      contents: write # a release, with its git tag, for each published version
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJSON(needs.prepare.outputs.chained) }}
+    uses: ./.github/workflows/build-image.yml
+    with:
+      image: ${{ matrix.image.name }}
+      repository: ${{ matrix.image.repository }}
+      archs: ${{ toJSON(matrix.image.archs) }}
+      variants: ${{ toJSON(matrix.image.variants) }}
+      version: ${{ matrix.image.version }}

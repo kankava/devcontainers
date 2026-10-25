@@ -1,0 +1,133 @@
+name: Build image
+
+# Builds and tests one image, each variant natively on each architecture's runner, then combines
+# the builds into the published multi-architecture tags and creates a release. Called by images.yml.
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: The image's folder under images/, e.g. base-debian
+        type: string
+        required: true
+      repository:
+        description: Where it's published under the registry, e.g. base
+        type: string
+        required: true
+      archs:
+        description: JSON list of architectures, e.g. ["amd64", "arm64"]
+        type: string
+        required: true
+      variants:
+        description: JSON list of the variants to build, the default first, each with its space-separated tags to publish, e.g. [{"name":"trixie","tags":"trixie latest …"}]
+        type: string
+        required: true
+      version:
+        description: The image's version from its image.json, e.g. 1.0.0
+        type: string
+        required: true
+
+env:
+  REGISTRY: ghcr.io/kankava/devcontainer-images
+
+jobs:
+  build:
+    name: build (${{ matrix.variant.name }}, ${{ matrix.arch }})
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ${{ fromJSON(inputs.archs) }}
+        variant: ${{ fromJSON(inputs.variants) }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - run: npm install -g @devcontainers/cli
+      - name: Build
+        run: scripts/build.sh "${{ inputs.image }}"
+        env:
+          VARIANT: ${{ matrix.variant.name }}
+          TAGS: build-${{ matrix.variant.name }}-${{ matrix.arch }}
+      - name: Test
+        run: scripts/test.sh "${{ inputs.image }}"
+        env:
+          VARIANT: ${{ matrix.variant.name }}
+          TAG: build-${{ matrix.variant.name }}-${{ matrix.arch }}
+      # Under a tag per variant and architecture, which the merge job combines
+      - name: Push
+        run: docker push "${REGISTRY}/${{ inputs.repository }}:build-${{ matrix.variant.name }}-${{ matrix.arch }}"
+
+  # Publishes only once every variant has built and passed its tests on every architecture
+  merge:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # the release and its git tag
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # for the release notes: the commits since the last published version
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Combine the architectures into the published tags
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ inputs.repository }}
+          ARCHS: ${{ inputs.archs }}
+          VARIANTS: ${{ inputs.variants }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          for variant in $(jq -r '.[].name' <<< "${VARIANTS}"); do
+              mapfile -t sources < <(jq -r --arg image "${IMAGE}" --arg variant "${variant}" '.[] | "\($image):build-\($variant)-\(.)"' <<< "${ARCHS}")
+              read -ra tags <<< "$(jq -r --arg variant "${variant}" '.[] | select(.name == $variant) | .tags' <<< "${VARIANTS}")"
+              args=()
+              for tag in "${tags[@]}"; do
+                  args+=(--tag "${IMAGE}:${tag}")
+              done
+              docker buildx imagetools create "${args[@]}" "${sources[@]}"
+              docker buildx imagetools inspect "${IMAGE}:${VERSION}-${variant}"
+          done
+      # The release's git tag, image_<name>_<version>, marks the commit that published this
+      # version, which images.yml compares with to check for changes without a version bump
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          NAME: ${{ inputs.image }}
+          VERSION: ${{ inputs.version }}
+          VARIANTS: ${{ inputs.variants }}
+          IMAGE: ${{ env.REGISTRY }}/${{ inputs.repository }}
+        run: |
+          tag="image_${NAME}_${VERSION}"
+          if gh release view "${tag}" > /dev/null 2>&1; then
+              echo "${tag} is already released"
+              exit 0
+          fi
+          last="$(git tag -l "image_${NAME}_*" | sed "s/^image_${NAME}_//" | grep -vxF "${VERSION}" | sort -V | tail -1 || true)"
+          mapfile -t inputs < <(scripts/inputs.sh "${NAME}")
+          {
+              # The default variant under the bare version, the others with theirs
+              echo '```sh'
+              jq -r --arg image "${IMAGE}" --arg version "${VERSION}" \
+                  'to_entries[] | "docker pull \($image):\($version)\(if .key == 0 then "" else "-\(.value.name)" end)"' <<< "${VARIANTS}"
+              echo '```'
+              echo
+              scripts/image-info.sh "${NAME}" | jq -r '.parent | select(.) | "Built on `\(.repository):\(.version)-\(.variant)`.\n"'
+              if [[ -z "${last}" ]]; then
+                  echo "First release."
+              else
+                  echo "Changes since ${last}:"
+                  echo
+                  git log --format='- %s (%h)' "image_${NAME}_${last}..${GITHUB_SHA}" -- "${inputs[@]}"
+              fi
+          } > "${RUNNER_TEMP}/notes.md"
+          gh release create "${tag}" --target "${GITHUB_SHA}" --title "${NAME} ${VERSION}" --notes-file "${RUNNER_TEMP}/notes.md"
